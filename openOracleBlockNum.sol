@@ -163,6 +163,7 @@ function _validateDispute(
     require(status.currentReporter != address(0), "No report to dispute");
     require(blockNum <= status.reportTimestamp + meta.settlementTime, "Dispute period over");
     require(!status.isSettled, "Report already settled");
+    require(!status.isDistributed, "Report is already distributed");
     require(tokenToSwap == meta.token1 || tokenToSwap == meta.token2, "Invalid token to swap");
 
     require(status.lastDisputeBlock != blockNum, "Dispute already occurred in this block");
