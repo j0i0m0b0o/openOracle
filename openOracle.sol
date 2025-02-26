@@ -3,7 +3,7 @@
 // This contract is for researching if the economic incentives in the design work.
 // With appropriate oracle parameters, auction expiration is evidence of a good price.
 // https://openprices.gitbook.io/openoracle-docs
-// v0.1.5
+// v0.1.6
 
 pragma solidity ^0.8.26;
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
@@ -25,6 +25,8 @@ contract openOracle is ReentrancyGuard {
         uint256 exactToken1Report;
         uint256 fee;
         uint256 escalationHalt;
+        uint256 disputeDelay;
+        uint256 protocolFee;
     }
 
     struct ReportStatus {
@@ -49,7 +51,9 @@ contract openOracle is ReentrancyGuard {
     mapping(uint256 => ReportMeta) public reportMeta;
     mapping(uint256 => ReportStatus) public reportStatus;
 
-    event ReportInstanceCreated(uint256 indexed reportId, address indexed token1Address, address indexed token2Address, uint256 feePercentage, uint256 multiplier, uint256 exactToken1Report, uint256 ethFee, address creator, uint256 settlementTime);
+    mapping(address => uint256) public protocolFees;
+
+    event ReportInstanceCreated(uint256 indexed reportId, address indexed token1Address, address indexed token2Address, uint256 feePercentage, uint256 multiplier, uint256 exactToken1Report, uint256 ethFee, address creator, uint256 settlementTime, uint256 escalationHalt, uint256 disputeDelay, uint256 protocolFee);
     event InitialReportSubmitted(uint256 indexed reportId, address reporter, uint256 amount1, uint256 amount2, address indexed token1Address, address indexed token2Address);
     event ReportDisputed(uint256 indexed reportId, address disputer, uint256 newAmount1, uint256 newAmount2, address indexed token1Address, address indexed token2Address);
     event ReportSettled(uint256 indexed reportId, uint256 price, uint256 settlementTimestamp);
@@ -61,11 +65,14 @@ contract openOracle is ReentrancyGuard {
         uint256 feePercentage, // in thousandths of a basis point i.e. 3000 means 3bps.
         uint256 multiplier, //in percentage points i.e. 110 means multiplier of 1.1x
         uint256 settlementTime,
-        uint256 escalationHalt // when exactToken1Report passes this, the multiplier drops to 100 after
+        uint256 escalationHalt, // when exactToken1Report passes this, the multiplier drops to 100 after
+        uint256 disputeDelay, // seconds, increase free option cost for self dispute games
+        uint256 protocolFee //in thousandths of a basis point
     ) external payable returns (uint256 reportId) {
         require(msg.value > 100, "Fee must be greater than 100 wei");
         require(exactToken1Report > 0, "exactToken1Report must be greater than zero");
         require(token1Address != token2Address, "Tokens must be different");
+        require(settlementTime > disputeDelay);
 
         reportId = nextReportId++;
         ReportMeta storage meta = reportMeta[reportId];
@@ -77,8 +84,10 @@ contract openOracle is ReentrancyGuard {
         meta.settlementTime = settlementTime;
         meta.fee = msg.value;
         meta.escalationHalt = escalationHalt;
+        meta.disputeDelay = disputeDelay;
+        meta.protocolFee = protocolFee;
 
-        emit ReportInstanceCreated(reportId, token1Address, token2Address, feePercentage, multiplier, exactToken1Report, msg.value, msg.sender, settlementTime);
+        emit ReportInstanceCreated(reportId, token1Address, token2Address, feePercentage, multiplier, exactToken1Report, msg.value, msg.sender, settlementTime, escalationHalt, disputeDelay, protocolFee);
 
     }
 
@@ -148,13 +157,14 @@ function _validateDispute(
     require(tokenToSwap == meta.token1 || tokenToSwap == meta.token2, "Invalid token to swap");
 
     require(status.lastDisputeBlock != getL2BlockNumber(), "Dispute already occurred in this block");
+    require(block.timestamp >= status.reportTimestamp + meta.disputeDelay, "Dispute too early");
 
     uint256 oldAmount1 = status.currentAmount1;
 
     if(meta.escalationHalt > oldAmount1){
-    require(newAmount1 == (oldAmount1 * meta.multiplier) / 100, "Invalid newAmount1: does not match multiplier of old amount");
+    require(newAmount1 == (oldAmount1 * meta.multiplier) / 100, "Invalid newAmount1: does not match multiplier on old amount");
     }else{
-    require(newAmount1 == oldAmount1, "Invalid newAmount1: does not match old amount. Escalation halt.");
+    require(newAmount1 == oldAmount1, "Invalid newAmount1: does not match old amount. Escalation halted.");
     }
 
     uint256 oldPrice = (oldAmount1 * 1e18) / status.currentAmount2;
@@ -173,8 +183,11 @@ function _handleToken1Swap(
     uint256 oldAmount1 = status.currentAmount1;
     uint256 oldAmount2 = status.currentAmount2;
     uint256 fee = (oldAmount1 * meta.feePercentage) / 1e7;
+    
+    uint256 protocolFee = (oldAmount1 * meta.protocolFee) / 1e7;
+    protocolFees[meta.token1] += protocolFee;
 
-    IERC20(meta.token1).safeTransferFrom(msg.sender, address(this), oldAmount1 + fee);
+    IERC20(meta.token1).safeTransferFrom(msg.sender, address(this), oldAmount1 + fee + protocolFee);
     IERC20(meta.token1).safeTransfer(status.currentReporter, 2 * oldAmount1 + fee);
 
     uint256 requiredToken1Contribution;
@@ -207,7 +220,10 @@ function _handleToken2Swap(
     uint256 oldAmount2 = status.currentAmount2;
     uint256 fee = (oldAmount2 * meta.feePercentage) / 1e7;
 
-    IERC20(meta.token2).safeTransferFrom(msg.sender, address(this), oldAmount2 + fee);
+    uint256 protocolFee = (oldAmount2 * meta.protocolFee) / 1e7;
+    protocolFees[meta.token2] += protocolFee;
+
+    IERC20(meta.token2).safeTransferFrom(msg.sender, address(this), oldAmount2 + fee + protocolFee);
     IERC20(meta.token2).safeTransfer(status.currentReporter, 2 * oldAmount2 + fee);
 
     uint256 requiredToken1Contribution;
@@ -328,6 +344,12 @@ function _transferTokens(address token, address from, address to, uint256 amount
         );
         require(success, "Call to ArbSys failed");
         return abi.decode(data, (uint256));
+    }
+
+    function getProtocolFees(address tokenToGet) external nonReentrant {
+        uint256 amount = protocolFees[tokenToGet];
+        _transferTokens(tokenToGet, address(this), payable(0x043c740dB5d907aa7604c2E8E9E0fffF435fa0e4), amount);
+        protocolFees[tokenToGet] = 0;
     }
 
 }
