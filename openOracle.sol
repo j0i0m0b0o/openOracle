@@ -27,6 +27,7 @@ contract openOracle is ReentrancyGuard {
         uint256 escalationHalt;
         uint256 disputeDelay;
         uint256 protocolFee;
+        uint256 settlerReward;
     }
 
     struct ReportStatus {
@@ -53,7 +54,7 @@ contract openOracle is ReentrancyGuard {
 
     mapping(address => uint256) public protocolFees;
 
-    event ReportInstanceCreated(uint256 indexed reportId, address indexed token1Address, address indexed token2Address, uint256 feePercentage, uint256 multiplier, uint256 exactToken1Report, uint256 ethFee, address creator, uint256 settlementTime, uint256 escalationHalt, uint256 disputeDelay, uint256 protocolFee);
+    event ReportInstanceCreated(uint256 indexed reportId, address indexed token1Address, address indexed token2Address, uint256 feePercentage, uint256 multiplier, uint256 exactToken1Report, uint256 ethFee, address creator, uint256 settlementTime, uint256 escalationHalt, uint256 disputeDelay, uint256 protocolFee, uint256 settlerReward);
     event InitialReportSubmitted(uint256 indexed reportId, address reporter, uint256 amount1, uint256 amount2, address indexed token1Address, address indexed token2Address);
     event ReportDisputed(uint256 indexed reportId, address disputer, uint256 newAmount1, uint256 newAmount2, address indexed token1Address, address indexed token2Address);
     event ReportSettled(uint256 indexed reportId, uint256 price, uint256 settlementTimestamp);
@@ -67,12 +68,14 @@ contract openOracle is ReentrancyGuard {
         uint256 settlementTime,
         uint256 escalationHalt, // when exactToken1Report passes this, the multiplier drops to 100 after
         uint256 disputeDelay, // seconds, increase free option cost for self dispute games
-        uint256 protocolFee //in thousandths of a basis point
+        uint256 protocolFee, //in thousandths of a basis point
+        uint256 settlerReward // in wei
     ) external payable returns (uint256 reportId) {
         require(msg.value > 100, "Fee must be greater than 100 wei");
         require(exactToken1Report > 0, "exactToken1Report must be greater than zero");
         require(token1Address != token2Address, "Tokens must be different");
         require(settlementTime > disputeDelay);
+        require(msg.value > settlerReward);
 
         reportId = nextReportId++;
         ReportMeta storage meta = reportMeta[reportId];
@@ -82,12 +85,13 @@ contract openOracle is ReentrancyGuard {
         meta.feePercentage = feePercentage;
         meta.multiplier = multiplier;
         meta.settlementTime = settlementTime;
-        meta.fee = msg.value;
+        meta.fee = msg.value - settlerReward;
         meta.escalationHalt = escalationHalt;
         meta.disputeDelay = disputeDelay;
         meta.protocolFee = protocolFee;
+        meta.settlerReward = settlerReward;
 
-        emit ReportInstanceCreated(reportId, token1Address, token2Address, feePercentage, multiplier, exactToken1Report, msg.value, msg.sender, settlementTime, escalationHalt, disputeDelay, protocolFee);
+        emit ReportInstanceCreated(reportId, token1Address, token2Address, feePercentage, multiplier, exactToken1Report, msg.value, msg.sender, settlementTime, escalationHalt, disputeDelay, protocolFee, settlerReward);
 
     }
 
@@ -251,10 +255,8 @@ function settle(uint256 reportId)
     ReportStatus storage status = reportStatus[reportId];
     ReportMeta storage meta = reportMeta[reportId];
 
-
-    uint256 fee = meta.fee;
-    uint256 settlerReward = fee / 10;
-    uint256 reporterReward = fee - settlerReward;
+    uint256 settlerReward = meta.settlerReward;
+    uint256 reporterReward = meta.fee;
 
     // Check if the report has already been settled or distributed
 
