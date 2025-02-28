@@ -55,8 +55,8 @@ contract openOracle is ReentrancyGuard {
     mapping(address => uint256) public protocolFees;
 
     event ReportInstanceCreated(uint256 indexed reportId, address indexed token1Address, address indexed token2Address, uint256 feePercentage, uint256 multiplier, uint256 exactToken1Report, uint256 ethFee, address creator, uint256 settlementTime, uint256 escalationHalt, uint256 disputeDelay, uint256 protocolFee, uint256 settlerReward);
-    event InitialReportSubmitted(uint256 indexed reportId, address reporter, uint256 amount1, uint256 amount2, address indexed token1Address, address indexed token2Address);
-    event ReportDisputed(uint256 indexed reportId, address disputer, uint256 newAmount1, uint256 newAmount2, address indexed token1Address, address indexed token2Address);
+    event InitialReportSubmitted(uint256 indexed reportId, address reporter, uint256 amount1, uint256 amount2, address indexed token1Address, address indexed token2Address, uint256 swapFee, uint256 protocolFee, uint256 settlementTime, uint256 disputeDelay, uint256 escalationHalt);
+    event ReportDisputed(uint256 indexed reportId, address disputer, uint256 newAmount1, uint256 newAmount2, address indexed token1Address, address indexed token2Address, uint256 swapFee, uint256 protocolFee, uint256 settlementTime, uint256 disputeDelay, uint256 escalationHalt);
     event ReportSettled(uint256 indexed reportId, uint256 price, uint256 settlementTimestamp);
 
     function createReportInstance(
@@ -114,7 +114,7 @@ contract openOracle is ReentrancyGuard {
         status.reportTimestamp = block.timestamp;
         status.price = (amount1 * 1e18) / amount2;
 
-        emit InitialReportSubmitted(reportId, msg.sender, amount1, amount2, meta.token1, meta.token2);
+        emit InitialReportSubmitted(reportId, msg.sender, amount1, amount2, meta.token1, meta.token2, meta.feePercentage, meta.protocolFee, meta.settlementTime, meta.disputeDelay, meta.escalationHalt);
     }
 
 function disputeAndSwap(uint256 reportId, address tokenToSwap, uint256 newAmount1, uint256 newAmount2) external nonReentrant {
@@ -142,7 +142,7 @@ function disputeAndSwap(uint256 reportId, address tokenToSwap, uint256 newAmount
     // Set the last dispute block to prevent multiple disputes in one block
     status.lastDisputeBlock = getL2BlockNumber();
     
-    emit ReportDisputed(reportId, msg.sender, newAmount1, newAmount2, meta.token1, meta.token2);
+    emit ReportDisputed(reportId, msg.sender, newAmount1, newAmount2, meta.token1, meta.token2, meta.feePercentage, meta.protocolFee, meta.settlementTime, meta.disputeDelay, meta.escalationHalt);
 }
 
 function _validateDispute(
