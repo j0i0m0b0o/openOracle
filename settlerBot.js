@@ -19,8 +19,8 @@ const CONTRACT_ADDRESS = '0x515061BE2A8968257712a5277dEc4BdA877BA765';
 
 // Poll intervals
 let lastBlockChecked = 0;
-const EVENT_POLL_INTERVAL_MS = 5000; // 5 seconds between event checks
-const MIN_POLL_INTERVAL_MS = 5000; // Minimum interval
+const EVENT_POLL_INTERVAL_MS = 1500; // 1.5 seconds between event checks
+const MIN_POLL_INTERVAL_MS = 1500; // Minimum interval
 const MAX_POLL_INTERVAL_MS = 120000; // Maximum backoff (2 minutes)
 const BACKOFF_MULTIPLIER = 2; // Multiply interval by this factor on errors
 
