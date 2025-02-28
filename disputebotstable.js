@@ -159,7 +159,7 @@ const txQueue = {
 };
 
 // Contract address
-const openOracleAddress = '0x0cd32fA8CB9F38aa7332F7A8dBeB258FB91226AB';
+const openOracleAddress = '0x515061BE2A8968257712a5277dEc4BdA877BA765';
 
 // Poll intervals
 let lastBlockChecked = 0;
@@ -196,7 +196,7 @@ const priceCache = {
 // Rate limiter for Kraken API
 const krakenRateLimiter = {
   lastCalled: 0,
-  MIN_INTERVAL_MS: 1000 // 1 second between calls
+  MIN_INTERVAL_MS: 1100 // 1 second between calls
 };
 
 // Set a minimum priority fee to ensure transactions don't get stuck
@@ -290,7 +290,10 @@ const openOracleAbi = [
       { "indexed": true, "internalType": "address", "name": "token1Address", "type": "address" },
       { "indexed": true, "internalType": "address", "name": "token2Address", "type": "address" },
       { "indexed": false, "internalType": "uint256", "name": "swapFee", "type": "uint256" },
-      { "indexed": false, "internalType": "uint256", "name": "protocolFee", "type": "uint256" }
+      { "indexed": false, "internalType": "uint256", "name": "protocolFee", "type": "uint256" },
+      { "indexed": false, "internalType": "uint256", "name": "settlementTime", "type": "uint256" },
+      { "indexed": false, "internalType": "uint256", "name": "disputeDelay", "type": "uint256" },
+      { "indexed": false, "internalType": "uint256", "name": "escalationHalt", "type": "uint256" }
     ],
     "name": "InitialReportSubmitted",
     "type": "event"
@@ -305,7 +308,10 @@ const openOracleAbi = [
       { "indexed": true, "internalType": "address", "name": "token1Address", "type": "address" },
       { "indexed": true, "internalType": "address", "name": "token2Address", "type": "address" },
       { "indexed": false, "internalType": "uint256", "name": "swapFee", "type": "uint256" },
-      { "indexed": false, "internalType": "uint256", "name": "protocolFee", "type": "uint256" }
+      { "indexed": false, "internalType": "uint256", "name": "protocolFee", "type": "uint256" },
+      { "indexed": false, "internalType": "uint256", "name": "settlementTime", "type": "uint256" },
+      { "indexed": false, "internalType": "uint256", "name": "disputeDelay", "type": "uint256" },
+      { "indexed": false, "internalType": "uint256", "name": "escalationHalt", "type": "uint256" }
     ],
     "name": "ReportDisputed",
     "type": "event"
@@ -510,21 +516,42 @@ const CONFIG = {
   LOG_LEVEL: 2
 };
 
-// Store report settlement times
+// Store report settlement times - Updated to be purely event-driven
 const reportSettlementInfo = {
-  // reportId -> {creationTime, settlementTime, escalationHalt, disputeDelay}
+  // reportId -> {reportTimestamp, settlementTime, escalationHalt, disputeDelay, currentAmount1}
   reports: new Map(),
   
-  // Add a new report
-  addReport(reportId, data) {
-    if (!this.reports.has(reportId)) {
-      this.reports.set(reportId, {
-        createdAt: Math.floor(Date.now() / 1000),
-        ...data
-      });
-      return true;
+  // Add or update a report from event data
+  updateFromEvent(reportId, eventData, isDispute = false) {
+    const currentReport = this.reports.get(reportId) || {};
+    
+    // Extract event data
+    const newData = {
+      settlementTime: Number(eventData.returnValues.settlementTime),
+      escalationHalt: Number(eventData.returnValues.escalationHalt),
+      disputeDelay: Number(eventData.returnValues.disputeDelay),
+    };
+    
+    // For initial reports, capture the initial amounts
+    if (!isDispute) {
+      newData.currentAmount1 = BigInt(eventData.returnValues.amount1);
+      newData.currentAmount2 = BigInt(eventData.returnValues.amount2);
+      newData.reportTimestamp = Math.floor(Date.now() / 1000); // Use current timestamp as report timestamp
+    } else {
+      // For disputes, update to new amounts
+      newData.currentAmount1 = BigInt(eventData.returnValues.newAmount1);
+      newData.currentAmount2 = BigInt(eventData.returnValues.newAmount2);
+      newData.reportTimestamp = Math.floor(Date.now() / 1000); // Update timestamp
     }
-    return false;
+    
+    // Update the report with new data
+    this.reports.set(reportId, {
+      ...currentReport,
+      ...newData,
+      createdAt: currentReport.createdAt || Math.floor(Date.now() / 1000)
+    });
+    
+    return true;
   },
   
   // Get settlement info for a report
@@ -533,12 +560,12 @@ const reportSettlementInfo = {
   },
   
   // Calculate time remaining until settlement window closes
-  getRemainingTime(reportId, currentTimestamp, reportTimestamp) {
+  getRemainingTime(reportId, currentTimestamp) {
     const info = this.getInfo(reportId);
-    if (!info) return null;
+    if (!info || !info.reportTimestamp) return null;
     
     // Calculate when settlement time will be reached
-    const settlementWindow = reportTimestamp + info.settlementTime;
+    const settlementWindow = info.reportTimestamp + info.settlementTime;
     return settlementWindow - currentTimestamp; // Seconds remaining
   },
   
@@ -570,7 +597,7 @@ const eventQueue = {
   processing: false,  // Flag to prevent concurrent processing
   
   // Add an event to the queue with calculated time remaining
-  addEvent(reportId, eventData, reportTimestamp) {
+  addEvent(reportId, eventData) {
     // Don't add duplicate reports
     if (this.pendingReports.some(item => item.reportId === reportId)) {
       return false;
@@ -580,9 +607,16 @@ const eventQueue = {
     const now = Math.floor(Date.now() / 1000);
     let timeRemaining = Infinity;
     
+    // Check if this is a new report or an update (dispute)
+    const isDispute = eventData.event === 'ReportDisputed';
+    
+    // Update the settlement info with data from this event
+    reportSettlementInfo.updateFromEvent(reportId, eventData, isDispute);
+    
+    // Get the updated settlement info
     const settlementInfo = reportSettlementInfo.getInfo(reportId);
-    if (settlementInfo && reportTimestamp) {
-      timeRemaining = reportSettlementInfo.getRemainingTime(reportId, now, reportTimestamp);
+    if (settlementInfo) {
+      timeRemaining = reportSettlementInfo.getRemainingTime(reportId, now);
       
       // If no time remaining or already past settlement, don't queue
       if (timeRemaining !== null && timeRemaining <= 0) {
@@ -1491,7 +1525,7 @@ async function individualSubmitTransactions(providerIndex, signedTxs, reportIds)
   return successfulReportIds;
 }
 
-// Build and queue a dispute transaction
+// Build and queue a dispute transaction with consideration for escalationHalt
 async function buildAndQueueDisputeTx(reportId, disputeParams, timeRemaining) {
   const { tokenToSwap, newAmount1, newAmount2 } = disputeParams;
   
@@ -1529,16 +1563,12 @@ async function buildAndQueueDisputeTx(reportId, disputeParams, timeRemaining) {
     } catch (error) {
       // Check if this is a "Dispute too early" error
       if (error.message && error.message.includes('Dispute too early')) {
-        // Get current timestamp and report data to calculate when we can retry
-        try {
-          const status = await web3.eth.getContract(openOracleAbi, openOracleAddress)
-                                    .methods.reportStatus(reportId).call();
-          const meta = await web3.eth.getContract(openOracleAbi, openOracleAddress)
-                                  .methods.reportMeta(reportId).call();
-          
-          const reportTimestamp = Number(status.reportTimestamp);
-          const disputeDelay = Number(meta.disputeDelay);
+        // Calculate when we can retry
+        const settlementInfo = reportSettlementInfo.getInfo(reportId);
+        if (settlementInfo) {
           const now = Math.floor(Date.now() / 1000);
+          const disputeDelay = settlementInfo.disputeDelay;
+          const reportTimestamp = settlementInfo.reportTimestamp;
           
           const timeUntilOpen = (reportTimestamp + disputeDelay) - now;
           if (timeUntilOpen > 0) {
@@ -1547,8 +1577,6 @@ async function buildAndQueueDisputeTx(reportId, disputeParams, timeRemaining) {
             queueReportForRetry(reportId, { disputeParams, timeRemaining }, delayMs);
             return true; // Return true because we've scheduled a retry
           }
-        } catch (fetchError) {
-          logger.error(`Error fetching report data for retry calculation:`, fetchError);
         }
       }
       
@@ -1820,7 +1848,7 @@ async function updatePriceCache() {
 // Function removed - using fixed cache TTL instead of volatility-based adaptive TTL
 
 /************************************************************
- *   Process a report with provided price data (modified to use multi-provider system)
+ *   Process a report with provided price data (event-driven implementation)
  ************************************************************/
 async function processReportWithPrices(reportId, eventData, priceData) {
   const idNum = Number(reportId);
@@ -1850,6 +1878,12 @@ async function processReportWithPrices(reportId, eventData, priceData) {
     // Track this report as being processed
     pendingDisputes.set(idNum, Date.now());
     logger.info(`Processing reportId=${idNum} with provided price data, locked for dispute processing`);
+    
+    // Update our settlement info if we received an event
+    const isDispute = eventData.event === 'ReportDisputed';
+    if (eventData.event === 'InitialReportSubmitted' || isDispute) {
+      reportSettlementInfo.updateFromEvent(idNum, eventData, isDispute);
+    }
     
     // Get report status and metadata with rate limit handling
     let status, meta;
@@ -1920,8 +1954,23 @@ async function processReportWithPrices(reportId, eventData, priceData) {
     // Check if the time window for disputes has closed
     const now = Math.floor(Date.now() / 1000);
     const reportTimestamp = Number(status.reportTimestamp);
-    const settlementTime = Number(meta.settlementTime);
-    const disputeDelay = Number(meta.disputeDelay);
+    
+    // Get settlement times from our cache (populated from event data)
+    const settlementInfo = reportSettlementInfo.getInfo(idNum);
+    let settlementTime, disputeDelay, escalationHalt;
+    
+    if (settlementInfo) {
+      settlementTime = settlementInfo.settlementTime;
+      disputeDelay = settlementInfo.disputeDelay;
+      escalationHalt = settlementInfo.escalationHalt;
+      logger.info(`Using event-derived settlement info: settlementTime=${settlementTime}s, disputeDelay=${disputeDelay}s, escalationHalt=${escalationHalt}`);
+    } else {
+      // Fallback to contract data if we don't have event data
+      settlementTime = Number(meta.settlementTime);
+      disputeDelay = Number(meta.disputeDelay);
+      escalationHalt = Number(meta.escalationHalt);
+      logger.info(`Using contract-derived settlement info: settlementTime=${settlementTime}s, disputeDelay=${disputeDelay}s, escalationHalt=${escalationHalt}`);
+    }
     
     if (now > reportTimestamp + settlementTime) {
       logger.info(`Skipping reportId=${idNum}, dispute window closed`);
@@ -1952,14 +2001,42 @@ async function processReportWithPrices(reportId, eventData, priceData) {
     
     // Determine which token to swap and calculate new amounts
     let tokenToSwap, newAmount1, newAmount2, totalCommitUsd;
+    
+    // Get the current amount of token1 and determine if we've hit escalationHalt
+    const currentAmount1 = BigInt(status.currentAmount1);
+    const currentAmount2 = BigInt(status.currentAmount2);
+    const multiplier = BigInt(meta.multiplier);
+    
+    // Check if we've reached escalation halt
+    const hasReachedEscalationHalt = BigInt(escalationHalt) <= currentAmount1;
+    logger.info(`Escalation check: currentAmount1=${currentAmount1}, escalationHalt=${escalationHalt}, hasReachedEscalationHalt=${hasReachedEscalationHalt}`);
+    
     if (token1Usd < token2Usd) {
       tokenToSwap = token1;
-      newAmount1 = (BigInt(status.currentAmount1) * BigInt(meta.multiplier)) / 100n;
+      
+      // Handle escalationHalt - if we've reached it, don't apply multiplier
+      if (hasReachedEscalationHalt) {
+        newAmount1 = currentAmount1; // Keep the same amount (escalation halted)
+        logger.info(`Escalation halted: keeping currentAmount1 at ${currentAmount1}`);
+      } else {
+        newAmount1 = (currentAmount1 * multiplier) / 100n;
+        logger.info(`Applying multiplier: ${multiplier}% to increase from ${currentAmount1} to ${newAmount1}`);
+      }
+      
       newAmount2 = BigInt(Math.floor((Number(newAmount1) / 1e18) * ethMid / usdcMid * 1e6));
       totalCommitUsd = token1Usd + (Number(meta.multiplier) / 100) * token1Usd + ((Number(meta.multiplier) / 100) - 1) * token2Usd;
     } else {
       tokenToSwap = token2;
-      newAmount1 = (BigInt(status.currentAmount1) * BigInt(meta.multiplier)) / 100n;
+      
+      // Handle escalationHalt for token1
+      if (hasReachedEscalationHalt) {
+        newAmount1 = currentAmount1; // Keep the same amount (escalation halted)
+        logger.info(`Escalation halted: keeping currentAmount1 at ${currentAmount1}`);
+      } else {
+        newAmount1 = (currentAmount1 * multiplier) / 100n;
+        logger.info(`Applying multiplier: ${multiplier}% to increase from ${currentAmount1} to ${newAmount1}`);
+      }
+      
       newAmount2 = BigInt(Math.floor((Number(newAmount1) / 1e18) * ethMid / usdcMid * 1e6));
       totalCommitUsd = token2Usd + (Number(meta.multiplier) / 100) * token2Usd + ((Number(meta.multiplier) / 100) - 1) * token1Usd;
     }
@@ -2030,11 +2107,11 @@ async function processReportWithPrices(reportId, eventData, priceData) {
     
     // Enhanced logging for profitability analysis
     logger.info(`Profitability analysis for reportId=${idNum}:`);
-    logger.info(`  Token1 USD: $${token1Usd.toFixed(2)}, Token2 USD: $${token2Usd.toFixed(2)}`);
-    logger.info(`  USD Diff: $${usdDiff.toFixed(2)}, Total Commit USD: $${totalCommitUsd.toFixed(2)}`);
-    logger.info(`  Swap Fee: $${swapFeeUsd.toFixed(2)}, Protocol Fee: $${protocolFeeUsd.toFixed(2)}`);
-    logger.info(`  Est. Gas Cost: $${gasCostUsd.toFixed(2)} (${gasCostEth.toFixed(6)} ETH at $${ethMid.toFixed(2)})`);
-    logger.info(`  Est. Net Profit: $${(usdDiff - swapFeeUsd - protocolFeeUsd - gasCostUsd).toFixed(2)}`);
+    logger.info(`  Token1 USD: ${token1Usd.toFixed(2)}, Token2 USD: ${token2Usd.toFixed(2)}`);
+    logger.info(`  USD Diff: ${usdDiff.toFixed(2)}, Total Commit USD: ${totalCommitUsd.toFixed(2)}`);
+    logger.info(`  Swap Fee: ${swapFeeUsd.toFixed(2)}, Protocol Fee: ${protocolFeeUsd.toFixed(2)}`);
+    logger.info(`  Est. Gas Cost: ${gasCostUsd.toFixed(2)} (${gasCostEth.toFixed(6)} ETH at ${ethMid.toFixed(2)})`);
+    logger.info(`  Est. Net Profit: ${(usdDiff - swapFeeUsd - protocolFeeUsd - gasCostUsd).toFixed(2)}`);
     logger.info(`  Profitability: ${(netProfitability * 100).toFixed(4)}%`);
     
     // Check if profitable enough to proceed
@@ -2161,197 +2238,6 @@ function purgeOldData() {
   if (global.gc) {
     logger.info(`Triggering garbage collection...`);
     global.gc();
-  }
-}
-
-/************************************************************
- *   MAIN LOGIC: checkForReportsToDispute
- ************************************************************/
-async function checkForReportsToDispute() {
-  try {
-    // Cleanup expired transaction locks
-    cleanupExpiredTransactions();
-    
-    // Clean up stale settlement info periodically
-    reportSettlementInfo.cleanupOldReports();
-    
-    // Process reports that were previously rate-limited and are ready for retry
-    await processRateLimitedReports();
-    
-    // Process a batch from the event queue
-    if (eventQueue.pendingReports.length > 0) {
-      logger.info(`Processing batch of events from queue (${eventQueue.pendingReports.length} pending reports)`);
-      const BATCH_SIZE = 10; // Process up to 10 reports at once
-      await eventQueue.processBatch(BATCH_SIZE);
-    }
-    
-    // Get latest block using the active provider
-    const providerIndex = getNextAvailableProvider();
-    if (providerIndex === -1) {
-      logger.warn(`No available providers to check for new blocks`);
-      return;
-    }
-    
-    let latestBlock;
-    try {
-      latestBlock = Number(await web3Instances[providerIndex].eth.getBlockNumber());
-      
-      // Reset backoff for this provider
-      resetProviderBackoff(providerIndex);
-    } catch (error) {
-      logger.error(`Error getting latest block:`, error);
-      if (isRateLimitError(error)) {
-        increaseBackoff();
-        applyProviderBackoff(providerIndex);
-      }
-      return;
-    }
-    
-    if (lastBlockChecked === 0) {
-      lastBlockChecked = latestBlock - 50; // Last 50 blocks on first run
-      logger.info(`First run, starting from block ${lastBlockChecked}`);
-      return;
-    }
-    
-    if (latestBlock < lastBlockChecked) {
-      logger.info(`Latest block (${latestBlock}) < lastBlockChecked (${lastBlockChecked}), skipping...`);
-      return;
-    }
-
-    // Limit the block range to avoid processing too many blocks at once
-    const MAX_BLOCKS_PER_QUERY = 50;
-    const fromBlock = lastBlockChecked + 1;
-    const toBlock = Math.min(latestBlock, fromBlock + MAX_BLOCKS_PER_QUERY - 1);
-    
-    logger.info(`Checking for events from block ${fromBlock} to ${toBlock}`);
-    
-    // Get events with potential rate limit handling
-    let events;
-    try {
-      const web3 = web3Instances[providerIndex];
-      const contract = new web3.eth.Contract(openOracleAbi, openOracleAddress);
-      
-      events = await contract.getPastEvents('allEvents', {
-        fromBlock,
-        toBlock
-      });
-      
-      // Only update lastBlockChecked if successfully got events
-      lastBlockChecked = toBlock;
-      
-      // If we successfully got events, we can reduce backoff
-      decreaseBackoff();
-      resetProviderBackoff(providerIndex);
-    } catch (error) {
-      logger.error(`Error getting past events: ${error.message}`);
-      
-      // Check if this is a rate limit error
-      if (isRateLimitError(error)) {
-        // Apply exponential backoff
-        increaseBackoff();
-        applyProviderBackoff(providerIndex);
-      }
-      
-      // Don't update lastBlockChecked to ensure we retry these blocks
-      return;
-    }
-    
-    logger.info(`Found ${events.length} total events`);
-    
-    // First process ReportInstanceCreated events to build our settlement info database
-    const creationEvents = events.filter(evt => evt.event === 'ReportInstanceCreated');
-    if (creationEvents.length > 0) {
-      logger.info(`Processing ${creationEvents.length} report creation events`);
-      
-      for (const evt of creationEvents) {
-        const reportId = Number(evt.returnValues.reportId);
-        const settlementTime = Number(evt.returnValues.settlementTime);
-        const escalationHalt = Number(evt.returnValues.escalationHalt);
-        const disputeDelay = Number(evt.returnValues.disputeDelay);
-        
-        // Store this info for future reference
-        reportSettlementInfo.addReport(reportId, {
-          settlementTime,
-          escalationHalt,
-          disputeDelay
-        });
-        
-        logger.info(`Recorded settlement info for reportId=${reportId}: settlementTime=${settlementTime}s, disputeDelay=${disputeDelay}s`);
-      }
-    }
-    
-    // Filter for actionable events (initial reports and disputes)
-    const actionableEvents = events.filter(evt => 
-      ['InitialReportSubmitted', 'ReportDisputed'].includes(evt.event)
-    );
-    logger.info(`Found ${actionableEvents.length} actionable events`);
-    
-    // Process settled events to avoid trying to dispute already settled reports
-    const settledEvents = events.filter(evt => evt.event === 'ReportSettled');
-    for (const evt of settledEvents) {
-      const reportId = Number(evt.returnValues.reportId);
-      logger.info(`Marking reportId=${reportId} as settled (from event)`);
-      processedReports.add(reportId);
-      reportTimestamps.set(reportId, Date.now());
-    }
-    
-    // Add actionable events to processing queue with time remaining info
-    let queuedCount = 0;
-    for (const evt of actionableEvents) {
-      const reportId = Number(evt.returnValues.reportId);
-      
-      // Skip already processed reports
-      if (processedReports.has(reportId) || pendingDisputes.has(reportId)) {
-        continue;
-      }
-      
-      // Get report status to determine current report timestamp
-      let reportTimestamp = null;
-      try {
-        const providerIdx = getNextAvailableProvider();
-        if (providerIdx === -1) {
-          logger.warn(`No available providers to get report status for ${reportId}`);
-          continue;
-        }
-        
-        const web3 = web3Instances[providerIdx];
-        const contract = new web3.eth.Contract(openOracleAbi, openOracleAddress);
-        
-        const status = await contract.methods.reportStatus(reportId).call();
-        reportTimestamp = Number(status.reportTimestamp);
-      } catch (error) {
-        logger.error(`Error getting report status for reportId=${reportId}:`, error);
-        if (!isRateLimitError(error)) continue;
-      }
-      
-      // Add to queue with report timestamp for time remaining calculation
-      if (eventQueue.addEvent(reportId, evt, reportTimestamp)) {
-        queuedCount++;
-      }
-    }
-    
-    logger.info(`Added ${queuedCount} new events to processing queue`);
-    
-    // Clean any old events from the queue
-    eventQueue.cleanQueue();
-    
-    // Process a batch immediately if we have new events
-    if (queuedCount > 0) {
-      const INITIAL_BATCH_SIZE = 5; // Process up to 5 reports on first pass
-      await eventQueue.processBatch(INITIAL_BATCH_SIZE);
-    }
-    
-    logger.info(`Successfully processed blocks ${fromBlock} to ${toBlock}`);
-  } catch (err) {
-    logger.error('Error in checkForReportsToDispute:', err);
-    
-    // Check if this is a rate limit error
-    if (isRateLimitError(err)) {
-      // Apply exponential backoff
-      increaseBackoff();
-    }
-    
-    // Don't update lastBlockChecked on error to ensure no blocks are missed
   }
 }
 
@@ -2505,10 +2391,160 @@ async function checkForCreatorMatch(reportId) {
 }
 
 /************************************************************
+ *   MAIN LOGIC: checkForReportsToDispute
+ ************************************************************/
+async function checkForReportsToDispute() {
+  try {
+    // Cleanup expired transaction locks
+    cleanupExpiredTransactions();
+    
+    // Clean up stale settlement info periodically
+    reportSettlementInfo.cleanupOldReports();
+    
+    // Process reports that were previously rate-limited and are ready for retry
+    await processRateLimitedReports();
+    
+    // Process a batch from the event queue
+    if (eventQueue.pendingReports.length > 0) {
+      logger.info(`Processing batch of events from queue (${eventQueue.pendingReports.length} pending reports)`);
+      const BATCH_SIZE = 10; // Process up to 10 reports at once
+      await eventQueue.processBatch(BATCH_SIZE);
+    }
+    
+    // Get latest block using the active provider
+    const providerIndex = getNextAvailableProvider();
+    if (providerIndex === -1) {
+      logger.warn(`No available providers to check for new blocks`);
+      return;
+    }
+    
+    let latestBlock;
+    try {
+      latestBlock = Number(await web3Instances[providerIndex].eth.getBlockNumber());
+      
+      // Reset backoff for this provider
+      resetProviderBackoff(providerIndex);
+    } catch (error) {
+      logger.error(`Error getting latest block:`, error);
+      if (isRateLimitError(error)) {
+        increaseBackoff();
+        applyProviderBackoff(providerIndex);
+      }
+      return;
+    }
+    
+    if (lastBlockChecked === 0) {
+      lastBlockChecked = latestBlock - 50; // Last 50 blocks on first run
+      logger.info(`First run, starting from block ${lastBlockChecked}`);
+      return;
+    }
+    
+    if (latestBlock < lastBlockChecked) {
+      logger.info(`Latest block (${latestBlock}) < lastBlockChecked (${lastBlockChecked}), skipping...`);
+      return;
+    }
+
+    // Limit the block range to avoid processing too many blocks at once
+    const MAX_BLOCKS_PER_QUERY = 50;
+    const fromBlock = lastBlockChecked + 1;
+    const toBlock = Math.min(latestBlock, fromBlock + MAX_BLOCKS_PER_QUERY - 1);
+    
+    logger.info(`Checking for events from block ${fromBlock} to ${toBlock}`);
+    
+    // Get events with potential rate limit handling
+    let events;
+    try {
+      const web3 = web3Instances[providerIndex];
+      const contract = new web3.eth.Contract(openOracleAbi, openOracleAddress);
+      
+      events = await contract.getPastEvents('allEvents', {
+        fromBlock,
+        toBlock
+      });
+      
+      // Only update lastBlockChecked if successfully got events
+      lastBlockChecked = toBlock;
+      
+      // If we successfully got events, we can reduce backoff
+      decreaseBackoff();
+      resetProviderBackoff(providerIndex);
+    } catch (error) {
+      logger.error(`Error getting past events: ${error.message}`);
+      
+      // Check if this is a rate limit error
+      if (isRateLimitError(error)) {
+        // Apply exponential backoff
+        increaseBackoff();
+        applyProviderBackoff(providerIndex);
+      }
+      
+      // Don't update lastBlockChecked to ensure we retry these blocks
+      return;
+    }
+    
+    logger.info(`Found ${events.length} total events`);
+    
+    // Filter for settled events to avoid trying to dispute already settled reports
+    const settledEvents = events.filter(evt => evt.event === 'ReportSettled');
+    for (const evt of settledEvents) {
+      const reportId = Number(evt.returnValues.reportId);
+      logger.info(`Marking reportId=${reportId} as settled (from event)`);
+      processedReports.add(reportId);
+      reportTimestamps.set(reportId, Date.now());
+    }
+    
+    // Filter for actionable events (initial reports and disputes)
+    const actionableEvents = events.filter(evt => 
+      ['InitialReportSubmitted', 'ReportDisputed'].includes(evt.event)
+    );
+    logger.info(`Found ${actionableEvents.length} actionable events`);
+    
+    // Add actionable events to processing queue with time remaining info
+    let queuedCount = 0;
+    for (const evt of actionableEvents) {
+      const reportId = Number(evt.returnValues.reportId);
+      
+      // Skip already processed reports
+      if (processedReports.has(reportId) || pendingDisputes.has(reportId)) {
+        continue;
+      }
+      
+      // Add to queue using event data for time remaining calculation
+      if (eventQueue.addEvent(reportId, evt)) {
+        queuedCount++;
+      }
+    }
+    
+    logger.info(`Added ${queuedCount} new events to processing queue`);
+    
+    // Clean any old events from the queue
+    eventQueue.cleanQueue();
+    
+    // Process a batch immediately if we have new events
+    if (queuedCount > 0) {
+      const INITIAL_BATCH_SIZE = 5; // Process up to 5 reports on first pass
+      await eventQueue.processBatch(INITIAL_BATCH_SIZE);
+    }
+    
+    logger.info(`Successfully processed blocks ${fromBlock} to ${toBlock}`);
+  } catch (err) {
+    logger.error('Error in checkForReportsToDispute:', err);
+    
+    // Check if this is a rate limit error
+    if (isRateLimitError(err)) {
+      // Apply exponential backoff
+      increaseBackoff();
+    }
+    
+    // Don't update lastBlockChecked on error to ensure no blocks are missed
+  }
+}
+
+/************************************************************
  *   MAIN FUNCTION
  ************************************************************/
 async function main() {
-  logger.info(`Starting Enhanced Dispute Bot: Multi-provider with JSON-RPC batching`);
+  logger.info(`Starting Enhanced Dispute Bot: Event-Driven Architecture with JSON-RPC batching`);
   
   // Initialize the RPC system
   initializeRpcSystem();
@@ -2562,6 +2598,7 @@ async function main() {
   logger.info(`Batch processing system: ${eventQueue.pendingReports.length} events in queue`);
   logger.info(`Profitability threshold: ${MIN_PROFITABILITY_THRESHOLD * 100}%`);
   logger.info(`Multi-provider system: ${RPC_CONFIG.providers.filter(p => p.enabled).length} active providers`);
+  logger.info(`Using event-driven architecture for report parameters (disputeDelay, settlementTime, escalationHalt)`);
   
   // Set up regular price updates on a fixed interval
   logger.info(`Setting up regular price updates every ${CONFIG.PRICE_UPDATE_INTERVAL_MS}ms`);

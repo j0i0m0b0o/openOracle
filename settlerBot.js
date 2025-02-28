@@ -15,7 +15,7 @@ const ARBITRUM_RPC = 'https://arb1.arbitrum.io/rpc';
 const web3 = new Web3(ARBITRUM_RPC);
 
 // Contract address
-const CONTRACT_ADDRESS = '0x0cd32fA8CB9F38aa7332F7A8dBeB258FB91226AB';
+const CONTRACT_ADDRESS = '0x515061BE2A8968257712a5277dEc4BdA877BA765';
 
 // Poll intervals
 let lastBlockChecked = 0;
@@ -37,6 +37,11 @@ const SETTLEMENT_LOCK_EXPIRY_MS = 60000; // 1 minute lock expiry
 const rateLimitedReports = new Map(); // reportId -> {retryCount, nextRetryTime, settleAfter}
 const MAX_RETRIES = 5;
 const RETRY_BACKOFF_BASE_MS = 3000; // Start with 3 seconds
+
+// Time sync retry specific configuration
+const TIME_SYNC_RETRY_INITIAL_MS = 2000; // 2 seconds initial retry
+const TIME_SYNC_RETRY_MAX_MS = 10000; // 10 seconds max retry delay
+const TIME_SYNC_MAX_RETRIES = 10; // More retries for time sync issues
 
 // Track the timestamp of when reports were processed
 const reportTimestamps = new Map();
@@ -95,7 +100,10 @@ const openOracleAbi = [
       { "indexed": true, "internalType": "address", "name": "token1Address", "type": "address" },
       { "indexed": true, "internalType": "address", "name": "token2Address", "type": "address" },
       { "indexed": false, "internalType": "uint256", "name": "swapFee", "type": "uint256" },
-      { "indexed": false, "internalType": "uint256", "name": "protocolFee", "type": "uint256" }
+      { "indexed": false, "internalType": "uint256", "name": "protocolFee", "type": "uint256" },
+      { "indexed": false, "internalType": "uint256", "name": "settlementTime", "type": "uint256" },
+      { "indexed": false, "internalType": "uint256", "name": "disputeDelay", "type": "uint256" },
+      { "indexed": false, "internalType": "uint256", "name": "escalationHalt", "type": "uint256" }
     ],
     "name": "InitialReportSubmitted",
     "type": "event"
@@ -110,7 +118,10 @@ const openOracleAbi = [
       { "indexed": true, "internalType": "address", "name": "token1Address", "type": "address" },
       { "indexed": true, "internalType": "address", "name": "token2Address", "type": "address" },
       { "indexed": false, "internalType": "uint256", "name": "swapFee", "type": "uint256" },
-      { "indexed": false, "internalType": "uint256", "name": "protocolFee", "type": "uint256" }
+      { "indexed": false, "internalType": "uint256", "name": "protocolFee", "type": "uint256" },
+      { "indexed": false, "internalType": "uint256", "name": "settlementTime", "type": "uint256" },
+      { "indexed": false, "internalType": "uint256", "name": "disputeDelay", "type": "uint256" },
+      { "indexed": false, "internalType": "uint256", "name": "escalationHalt", "type": "uint256" }
     ],
     "name": "ReportDisputed",
     "type": "event"
@@ -239,23 +250,53 @@ function isRateLimitError(error) {
   );
 }
 
-// Add a report to retry queue
-function queueReportForRetry(reportId, settleAfter) {
-  const retryInfo = rateLimitedReports.get(reportId) || { 
+// Function to check if an error is likely due to time synchronization
+function isTimeSyncError(error) {
+  if (!error) return false;
+  
+  const errorMessage = error.message || '';
+  
+  return (
+    errorMessage.includes("execution reverted") ||
+    errorMessage.includes("Settlement time not reached") ||
+    errorMessage.includes("timestamp") ||
+    errorMessage.includes("function call failed")
+  );
+}
+
+// Add a report to retry queue for rate limiting
+function queueReportForRetry(reportId, settleAfter, options = {}) {
+  const { isTimeSync = false } = options;
+  
+  const existingEntry = rateLimitedReports.get(reportId);
+  const retryInfo = existingEntry || { 
     retryCount: 0, 
     nextRetryTime: 0, 
-    settleAfter: settleAfter || 0 
+    settleAfter: settleAfter || 0,
+    isTimeSync: isTimeSync
   };
   
   retryInfo.retryCount++;
   
   // Calculate next retry time with exponential backoff
-  const backoffMs = RETRY_BACKOFF_BASE_MS * Math.pow(2, retryInfo.retryCount - 1);
+  let backoffMs;
+  
+  if (isTimeSync) {
+    // Shorter retry cycle for time sync issues
+    const maxRetries = TIME_SYNC_MAX_RETRIES;
+    const factor = Math.min(retryInfo.retryCount, maxRetries);
+    backoffMs = Math.min(TIME_SYNC_RETRY_INITIAL_MS * Math.pow(1.5, factor - 1), TIME_SYNC_RETRY_MAX_MS);
+    retryInfo.isTimeSync = true;
+  } else {
+    // Standard retry for rate limiting
+    backoffMs = RETRY_BACKOFF_BASE_MS * Math.pow(2, retryInfo.retryCount - 1);
+  }
+  
   retryInfo.nextRetryTime = Date.now() + backoffMs;
   
   rateLimitedReports.set(reportId, retryInfo);
   
-  console.log(`Queued reportId=${reportId} for retry #${retryInfo.retryCount} in ${backoffMs}ms (at ${new Date(retryInfo.nextRetryTime).toISOString()})`);
+  console.log(`Queued reportId=${reportId} for ${isTimeSync ? 'time sync' : 'standard'} retry #${retryInfo.retryCount} in ${backoffMs}ms (at ${new Date(retryInfo.nextRetryTime).toISOString()})`);
   
   // Remove from pending to allow retry
   pendingSettlements.delete(reportId);
@@ -280,13 +321,14 @@ async function processRateLimitedReports() {
   
   // Process each ready report
   for (const { reportId, retryInfo } of reportsToRetry) {
-    console.log(`Retrying reportId=${reportId} (attempt #${retryInfo.retryCount} of ${MAX_RETRIES})`);
+    console.log(`Retrying reportId=${reportId} (attempt #${retryInfo.retryCount} of ${retryInfo.isTimeSync ? TIME_SYNC_MAX_RETRIES : MAX_RETRIES})`);
     
     // Remove from retry queue - will be added back if it fails again
     rateLimitedReports.delete(reportId);
     
-    if (retryInfo.retryCount > MAX_RETRIES) {
-      console.log(`Reached maximum retry attempts (${MAX_RETRIES}) for reportId=${reportId}, abandoning`);
+    const maxRetries = retryInfo.isTimeSync ? TIME_SYNC_MAX_RETRIES : MAX_RETRIES;
+    if (retryInfo.retryCount > maxRetries) {
+      console.log(`Reached maximum retry attempts (${maxRetries}) for reportId=${reportId}, abandoning`);
       continue;
     }
     
@@ -429,7 +471,8 @@ function purgeOldData() {
   // 4. Clean up stale retry reports that exceeded max retries
   let retryPurgeCount = 0;
   for (const [reportId, retryInfo] of rateLimitedReports.entries()) {
-    if (retryInfo.retryCount > MAX_RETRIES || now - retryInfo.nextRetryTime > REPORT_AGE_THRESHOLD_MS) {
+    const maxRetries = retryInfo.isTimeSync ? TIME_SYNC_MAX_RETRIES : MAX_RETRIES;
+    if (retryInfo.retryCount > maxRetries || now - retryInfo.nextRetryTime > REPORT_AGE_THRESHOLD_MS) {
       rateLimitedReports.delete(reportId);
       retryPurgeCount++;
     }
@@ -471,6 +514,9 @@ async function isReportSettleable(reportId) {
     // Important: If this report has been disputed, the reportTimestamp will be updated to the 
     // time of the last dispute, which effectively resets the settlement clock
     const wasDisputed = status.disputeOccurred;
+    
+    // Log detailed timing information for debugging
+    console.log(`Report ${reportId} timing: reportTimestamp=${reportTimestamp}, settlementTime=${settleTimeSeconds}, current time=${now}, required time=${reportTimestamp + settleTimeSeconds}`);
     
     // Check if settlement time has passed
     if (now < reportTimestamp + settleTimeSeconds) {
@@ -571,6 +617,26 @@ async function trySettleReport(reportId) {
       console.log(`Note: This report was previously disputed, which reset the settlement clock`);
     }
     
+    // Pre-flight check - call the function to see if it would revert
+    try {
+      await openOracleContract.methods.settle(idNum).call({ from: account.address });
+      console.log(`Pre-flight check passed for reportId=${idNum}`);
+    } catch (preflightErr) {
+      console.error(`Settlement would fail for reportId=${idNum}: ${preflightErr.message}`);
+      
+      // Check if this is a time sync error
+      if (isTimeSyncError(preflightErr)) {
+        console.log(`Time sync error detected. Scheduling quick retry for reportId=${idNum}`);
+        queueReportForRetry(idNum, 0, { isTimeSync: true });
+        return;
+      }
+      
+      // For other errors, use standard retry
+      queueReportForRetry(idNum, Date.now() + 60000);
+      pendingSettlements.delete(idNum);
+      return;
+    }
+    
     // Build the transaction data
     const settleData = openOracleContract.methods.settle(idNum).encodeABI();
     
@@ -590,6 +656,12 @@ async function trySettleReport(reportId) {
       if (isRateLimitError(gasErr)) {
         // Queue for retry if rate limited
         queueReportForRetry(idNum, 0);
+        return;
+      }
+      
+      if (isTimeSyncError(gasErr)) {
+        // Quick retry for time sync errors
+        queueReportForRetry(idNum, 0, { isTimeSync: true });
         return;
       }
       
@@ -688,6 +760,13 @@ async function trySettleReport(reportId) {
         return;
       }
       
+      if (isTimeSyncError(txErr)) {
+        // Quick retry for time sync errors
+        console.log(`Time sync error during transaction send. Scheduling quick retry for reportId=${idNum}`);
+        queueReportForRetry(idNum, 0, { isTimeSync: true });
+        return;
+      }
+      
       if (txErr.message && txErr.message.includes('insufficient funds')) {
         console.error(`ERROR: Insufficient funds in wallet. Check your ETH balance.`);
       }
@@ -697,6 +776,11 @@ async function trySettleReport(reportId) {
     
     if (isRateLimitError(error)) {
       queueReportForRetry(idNum, 0);
+      return;
+    }
+    
+    if (isTimeSyncError(error)) {
+      queueReportForRetry(idNum, 0, { isTimeSync: true });
       return;
     }
   } finally {
@@ -979,7 +1063,7 @@ async function watchForEvents() {
  *   Periodic tasks
  ************************************************************/
 async function main() {
-  console.log(`Starting Settler Bot: EIP-1559 with rate limit handling`);
+  console.log(`Starting Settler Bot: EIP-1559 with time sync retry handling`);
   console.log(`Bot account: ${account.address}`);
   
   // Check account balance at startup
@@ -1002,7 +1086,8 @@ async function main() {
   console.log(`Event poll interval: ${MIN_POLL_INTERVAL_MS}ms (min) to ${MAX_POLL_INTERVAL_MS}ms (max)`);
   console.log(`Memory cleanup interval: ${MEMORY_CLEANUP_INTERVAL_MS}ms`);
   console.log(`Scheduler check interval: ${SCHEDULER_CHECK_INTERVAL_MS}ms`);
-  console.log(`Retry system: up to ${MAX_RETRIES} retries with exponential backoff (base: ${RETRY_BACKOFF_BASE_MS}ms)`);
+  console.log(`Time sync retry: ${TIME_SYNC_RETRY_INITIAL_MS}ms initial, ${TIME_SYNC_RETRY_MAX_MS}ms max, ${TIME_SYNC_MAX_RETRIES} max tries`);
+  console.log(`Standard retry: ${RETRY_BACKOFF_BASE_MS}ms base, ${MAX_RETRIES} max tries`);
   
   // Initial check with a small delay to allow system to initialize
   setTimeout(() => {

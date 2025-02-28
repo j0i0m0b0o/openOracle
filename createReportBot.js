@@ -20,7 +20,7 @@ const { Web3 } = require('web3');
 // ========== USER CONFIG AREA ==========
 
 // The address of your deployed openOracle contract (v0.1.6).
-const CONTRACT_ADDRESS = "0x0cd32fA8CB9F38aa7332F7A8dBeB258FB91226AB"; // <--- Update as needed
+const CONTRACT_ADDRESS = "0x515061BE2A8968257712a5277dEc4BdA877BA765"; // <--- Update as needed
 
 // Your Arbitrum RPC endpoint:
 const RPC_ENDPOINT = "https://arb1.arbitrum.io/rpc";
@@ -33,12 +33,12 @@ const immediateSend = true;
 const token1Address = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
 const token2Address = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 const exactToken1Report = "3630000000000000";  // e.g. 0.00363 ETH in wei
-const feePercentage = "2222";                  // 4 bps in thousandths of a basis point (4000 = 0.04%)
+const feePercentage = "0";               // 4 bps in thousandths of a basis point (4000 = 0.04%)
 const multiplier = "110";                   // 1.1x (110%)
 const settlementTime = "8";                   // 18 seconds
 const escalationHalt = "1000000000000000000000"; // 1000 ETH in wei
 const disputeDelay = "0";                      // 1 second
-const protocolFee = "1000";                    // 1 bp (0.01%) in thousandths of a basis point
+const protocolFee = "2222";                    // 1 bp (0.01%) in thousandths of a basis point
 
 // The new parameter for v0.1.6 - settlerReward (in wei).
 // Must be strictly less than the total msg.value you send.

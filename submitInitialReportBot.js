@@ -16,7 +16,7 @@ const ARBITRUM_RPC = 'https://arb1.arbitrum.io/rpc';
 const web3 = new Web3(ARBITRUM_RPC);
 
 // Contract address
-const openOracleAddress = '0x0cd32fA8CB9F38aa7332F7A8dBeB258FB91226AB'; // replace if needed
+const openOracleAddress = '0x515061BE2A8968257712a5277dEc4BdA877BA765'; // replace if needed
 
 // Poll intervals
 let lastBlockChecked = 0;
@@ -555,7 +555,7 @@ async function processReportEvent(reportId, eventData) {
     if (t1==='0x82af49447d8a07e3bd95bd0d56f35241523fbab1' && 
         t2==='0xaf88d065e77c8cc2239327c5edb3a432268e5831')
     {
-      if (feePctNum > 2000) {
+  	if (feePctNum > 0 || Number(protocolFee) > 0) {
         if (settTimeNum >= 5 && settTimeNum <= 25) {
           let ethUsdMid, usdcUsdMid;
           try {
@@ -599,7 +599,7 @@ async function processReportEvent(reportId, eventData) {
 
           // build tx data
           const submitData= openOracleContract.methods
-            .submitInitialReport(idNum, amount1Big.toString(), usdcAmount.toString())
+            .submitInitialReport(idNum, amount1Big.toString(), usdcAmount.toString() - 5000000)
             .encodeABI();
 
           // estimate gas
@@ -684,7 +684,7 @@ async function processReportEvent(reportId, eventData) {
           }
 
           // minimal profit
-          const minProfitUsd = 0.0001 * 2 * wethUsdValue;
+          const minProfitUsd = 0.0002 * 2 * wethUsdValue;
           const minProfitEth = minProfitUsd / ethUsdMid;
           const minProfitWei = BigInt(Math.floor(minProfitEth * 1e18));
           
