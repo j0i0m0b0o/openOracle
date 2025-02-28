@@ -599,7 +599,7 @@ async function processReportEvent(reportId, eventData) {
 
           // build tx data
           const submitData= openOracleContract.methods
-            .submitInitialReport(idNum, amount1Big.toString(), usdcAmount.toString() - 5000000)
+            .submitInitialReport(idNum, amount1Big.toString(), usdcAmount.toString())
             .encodeABI();
 
           // estimate gas
